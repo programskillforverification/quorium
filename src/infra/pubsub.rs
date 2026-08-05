@@ -1,4 +1,6 @@
-use async_trait::async_trait;
+use std::future::Future;
+
+use async_nats::Client;
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
 
@@ -20,16 +22,22 @@ pub struct Message {
 /// `subscribe` hands back a stream instead of taking a callback: the NATS
 /// subscriber already is a `Stream`, and a stream composes with `tokio::select!`
 /// for shutdown without boxing a closure into an `Arc`.
-#[async_trait]
 pub trait PubSub: Send + Sync + 'static {
-    async fn publish(&self, topic: &str, payload: Bytes) -> Result<(), PubSubError>;
+    fn publish(
+        &self,
+        topic: &str,
+        payload: Bytes,
+    ) -> impl Future<Output = Result<(), PubSubError>> + Send;
 
-    async fn subscribe(&self, topic: &str) -> Result<BoxStream<'static, Message>, PubSubError>;
+    fn subscribe(
+        &self,
+        topic: &str,
+    ) -> impl Future<Output = Result<BoxStream<'static, Message>, PubSubError>> + Send;
 }
 
 #[derive(Clone)]
 pub struct NatsPubSub {
-    client: async_nats::Client,
+    client: Client,
 }
 
 impl NatsPubSub {
@@ -45,12 +53,11 @@ impl NatsPubSub {
     }
 
     /// Escape hatch for the JetStream / KV APIs, which need the raw client.
-    pub fn client(&self) -> &async_nats::Client {
+    pub fn client(&self) -> &Client {
         &self.client
     }
 }
 
-#[async_trait]
 impl PubSub for NatsPubSub {
     async fn publish(&self, topic: &str, payload: Bytes) -> Result<(), PubSubError> {
         tracing::info!(%topic, bytes = payload.len(), "publishing");
@@ -71,14 +78,14 @@ impl PubSub for NatsPubSub {
     }
 
     async fn subscribe(&self, topic: &str) -> Result<BoxStream<'static, Message>, PubSubError> {
-        let subscriber =
-            self.client
-                .subscribe(topic.to_owned())
-                .await
-                .map_err(|source| PubSubError::Subscribe {
-                    topic: topic.to_owned(),
-                    source,
-                })?;
+        let subscriber = self
+            .client
+            .subscribe(topic.to_owned())
+            .await
+            .map_err(|source| PubSubError::Subscribe {
+                topic: topic.to_owned(),
+                source,
+            })?;
 
         let stream = subscriber
             .map(|msg| Message {
