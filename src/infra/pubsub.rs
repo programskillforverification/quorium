@@ -26,7 +26,7 @@ pub trait PubSub: Send + Sync + 'static {
     fn publish(
         &self,
         topic: &str,
-        payload: Bytes,
+        message: Bytes,
     ) -> impl Future<Output = Result<(), PubSubError>> + Send;
 
     fn subscribe(
@@ -52,26 +52,23 @@ impl NatsPubSub {
         Ok(Self { client })
     }
 
-    /// Escape hatch for the JetStream / KV APIs, which need the raw client.
     pub fn client(&self) -> &Client {
         &self.client
     }
 }
 
 impl PubSub for NatsPubSub {
-    async fn publish(&self, topic: &str, payload: Bytes) -> Result<(), PubSubError> {
-        tracing::info!(%topic, bytes = payload.len(), "publishing");
+    async fn publish(&self, topic: &str, message: Bytes) -> Result<(), PubSubError> {
+        tracing::info!(%topic, bytes = message.len(), "publishing");
 
         self.client
-            .publish(topic.to_owned(), payload)
+            .publish(topic.to_owned(), message)
             .await
             .map_err(|source| PubSubError::Publish {
                 topic: topic.to_owned(),
                 source,
             })?;
 
-        // Publishing is buffered; without this a short-lived process exits
-        // before the write hits the socket.
         self.client.flush().await?;
 
         Ok(())

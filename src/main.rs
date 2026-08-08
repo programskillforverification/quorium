@@ -1,4 +1,3 @@
-use anyhow::Context;
 use futures::StreamExt;
 use quorium::{NatsPubSub, PubSub};
 
@@ -16,9 +15,7 @@ async fn main() -> anyhow::Result<()> {
 
     let url = std::env::var("NATS_URL").unwrap_or_else(|_| DEFAULT_NATS_URL.to_owned());
 
-    let pubsub = NatsPubSub::connect(&url)
-        .await
-        .with_context(|| format!("connecting to NATS at {url}"))?;
+    let pubsub = NatsPubSub::connect(&url).await?;
     tracing::info!(%url, "connected to NATS");
 
     let mut keygen = pubsub.subscribe(TOPIC_KEYGEN).await?;

@@ -1,45 +1,126 @@
-//! Port of `cmd/nodes-backup/main.go`: make sure a peer roster exists, in both
-//! the KV bucket and `peers.json`, and print what it settled on.
+use async_nats::jetstream::kv::{self, Store};
+use bytes::Bytes;
+use futures::StreamExt;
+use uuid::Uuid;
 
-use anyhow::Context;
-use quorium::{JsonPeerStore, KvPeerStore, NatsPubSub, peers};
-
-const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:4222";
+const PEER_JSON_FILE_PATH: &str = "peers.json";
+const NATS_URL: &str = "nats://127.0.0.1:4222";
 const BUCKET: &str = "mpc-peers";
-const PEERS_FILE: &str = "peers.json";
-const DEFAULT_PEER_COUNT: usize = 3;
+
+fn generate_unique_peer_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+async fn load_peers_from_json() -> anyhow::Result<Vec<String>> {
+    // A missing file is not fatal: the caller reports it and carries on with an
+    // empty list.
+    let data = tokio::fs::read(PEER_JSON_FILE_PATH).await?;
+
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    Ok(serde_json::from_slice(&data)?)
+}
+
+async fn load_peers_from_kv(store: &Store) -> anyhow::Result<Vec<String>> {
+    let mut keys = store.keys().await?;
+
+    println!("Node IDs in the '{BUCKET}' bucket:");
+    let mut peers = Vec::new();
+    while let Some(key) = keys.next().await {
+        let key = key?;
+        let Some(value) = store.get(key.as_str()).await? else {
+            continue;
+        };
+
+        let value = String::from_utf8_lossy(&value).into_owned();
+        println!("Key: {key}, Value: {value}");
+        peers.push(value);
+    }
+
+    Ok(peers)
+}
+
+async fn store_peers_to_json(peers: &[String]) -> anyhow::Result<()> {
+    let json = serde_json::to_vec_pretty(peers)?;
+    tokio::fs::write(PEER_JSON_FILE_PATH, json).await?;
+
+    println!("Peers data has been written to {PEER_JSON_FILE_PATH}");
+    Ok(())
+}
+
+fn print_peers(peers: &[String]) {
+    println!("Peers:");
+    for peer in peers {
+        println!("{peer}");
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "quorium=info,nodes_backup=info".into()),
-        )
-        .init();
+    let client = async_nats::connect(NATS_URL).await?;
+    let jetstream = async_nats::jetstream::new(client);
+    let store = jetstream
+        .create_key_value(kv::Config {
+            bucket: BUCKET.to_owned(),
+            history: 1,
+            ..Default::default()
+        })
+        .await?;
 
-    let url = std::env::var("NATS_URL").unwrap_or_else(|_| DEFAULT_NATS_URL.to_owned());
-    let want = match std::env::var("PEER_COUNT") {
-        Ok(raw) => raw
-            .parse()
-            .with_context(|| format!("PEER_COUNT={raw} is not a number"))?,
-        Err(_) => DEFAULT_PEER_COUNT,
-    };
+    let peers = load_peers_from_kv(&store).await?;
 
-    let pubsub = NatsPubSub::connect(&url)
-        .await
-        .with_context(|| format!("connecting to NATS at {url}"))?;
-    tracing::info!(%url, "connected to NATS");
+    println!("Loaded peers from the bucket:");
+    print_peers(&peers);
 
-    let kv = KvPeerStore::open(pubsub.client().clone(), BUCKET).await?;
-    let file = JsonPeerStore::new(PEERS_FILE);
+    if peers.is_empty() {
+        let peers = match load_peers_from_json().await {
+            Ok(peers) => peers,
+            Err(err) => {
+                println!("{err}");
+                Vec::new()
+            }
+        };
 
-    let peers = peers::resolve(&kv, &file, want).await?;
+        if peers.is_empty() {
+            let node_ids = [
+                generate_unique_peer_id(),
+                generate_unique_peer_id(),
+                generate_unique_peer_id(),
+            ];
 
-    println!("Peers:");
-    for peer in &peers {
-        println!("  {peer}");
+            let mut keys = Vec::new();
+            for (id, node_id) in node_ids.iter().enumerate() {
+                let key = format!("node{id}-{node_id}");
+                keys.push(format!("{id}-{node_id}"));
+
+                match store.put(&key, Bytes::from_static(b"ok")).await {
+                    Ok(_) => eprintln!("Stored key {key}"),
+                    Err(err) => eprintln!("Failed to store key {key}: {err}"),
+                }
+            }
+
+            store_peers_to_json(&keys).await?;
+        }
     }
 
+    let peers = load_peers_from_kv(&store).await?;
+    print_peers(&peers);
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_peer_ids_are_distinct_uuids() {
+        let a = generate_unique_peer_id();
+        let b = generate_unique_peer_id();
+
+        assert_ne!(a, b);
+        assert!(a.parse::<Uuid>().is_ok());
+    }
 }
